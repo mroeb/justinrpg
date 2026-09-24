@@ -19,7 +19,7 @@ use rand::{thread_rng, Rng};
 
 use justin_rpg::config as cfg;
 use justin_rpg::protocol::{
-    ActionKind, C2S, CropSnap, EnemySnap, PlotSnap, PlayerSnap, S2C,
+    ActionKind, C2S, CropSnap, EnemySnap, NodeSnap, PlotSnap, PlayerSnap, S2C,
 };
 
 fn main() {
@@ -63,8 +63,10 @@ fn new_renet_server() -> (RenetServer, NetcodeServerTransport) {
 
 fn setup() {
     println!(
-        "World ready: {} farm plots, {} Hz tick, field {:?}.",
+        "World ready: {} farm plots, {} resource nodes, {} regions, {} Hz tick, field {:?}.",
         cfg::plot_count(),
+        cfg::node_count(),
+        cfg::REGIONS.len(),
         cfg::TICK_HZ,
         cfg::FIELD_HALF
     );
@@ -80,6 +82,16 @@ struct Player {
     seeds: i32,
     harvests: i32,
     kills: u32,
+    // Inventory (resources + consumables).
+    wood: i32,
+    stone: i32,
+    ore: i32,
+    turnips: i32,
+    potions: i32,
+    /// Owned equipment as a bitmask of `cfg::GEAR_*` bits.
+    gear: u8,
+    /// Region index this player was last in (for entry announcements).
+    region: u8,
     /// Latest received movement direction; sticky (client sends zeros when idle).
     move_input: [f32; 2],
     attack_cd: f32,
@@ -94,6 +106,13 @@ impl Player {
             seeds: cfg::STARTING_SEEDS,
             harvests: 0,
             kills: 0,
+            wood: 0,
+            stone: 0,
+            ore: 0,
+            turnips: 0,
+            potions: 0,
+            gear: 0,
+            region: cfg::region_index(pos[0], pos[1]) as u8,
             move_input: [0.0, 0.0],
             attack_cd: 0.0,
             regen_acc: 0.0,
@@ -121,11 +140,19 @@ struct Plot {
     crop: Option<Crop>,
 }
 
+/// Server-side state of a gatherable resource node (`cfg::NODE_DEFS` index).
+#[derive(Clone, Copy)]
+struct NodeState {
+    ready: bool,
+    timer: f32,
+}
+
 #[derive(Resource)]
 struct World {
     players: HashMap<ClientId, Player>,
     enemies: Vec<Enemy>,
     plots: Vec<Plot>,
+    nodes: Vec<NodeState>,
     next_enemy_id: u32,
     spawn_timer: f32,
     tick: u64,
@@ -139,6 +166,13 @@ impl Default for World {
             players: HashMap::new(),
             enemies: Vec::new(),
             plots: vec![Plot::default(); cfg::plot_count()],
+            nodes: vec![
+                NodeState {
+                    ready: true,
+                    timer: 0.0,
+                };
+                cfg::node_count()
+            ],
             next_enemy_id: 0,
             spawn_timer: cfg::ENEMY_SPAWN_INTERVAL,
             tick: 0,
@@ -181,7 +215,10 @@ fn on_client_event(
             // Onboarding only to the joining client.
             let welcome = S2C::Log {
                 text: "Welcome, OP protagonist! WASD move, SPACE one-punches, \
-                       E tends the nearest farm plot (till -> plant -> water -> harvest)."
+                       E tends the nearest farm plot, G gathers wood/stone/ore, \
+                       Q drinks a Healing Draught, and 1-6 craft at the workbench. \
+                       The Sanctuary at spawn is a safe zone: monsters cannot enter \
+                       and your wounds close fast."
                     .to_string(),
             };
             server.send_message(
@@ -265,6 +302,8 @@ fn handle_action(world: &mut World, client_id: ClientId, kind: ActionKind) {
             }
             player.attack_cd = cfg::ATTACK_COOLDOWN;
             let origin = player.pos;
+            let gear = player.gear;
+            let damage = cfg::attack_damage(gear);
 
             let range2 = cfg::ATTACK_RANGE * cfg::ATTACK_RANGE;
             let hit: Vec<u32> = world
@@ -281,7 +320,7 @@ fn handle_action(world: &mut World, client_id: ClientId, kind: ActionKind) {
                 return;
             }
             for e in world.enemies.iter_mut().filter(|e| hit.contains(&e.id)) {
-                e.hp -= cfg::ATTACK_DAMAGE;
+                e.hp -= damage;
             }
 
             let mut rng = thread_rng();
@@ -298,7 +337,13 @@ fn handle_action(world: &mut World, client_id: ClientId, kind: ActionKind) {
                 );
                 if let Some(p) = world.players.get_mut(&client_id) {
                     p.kills += 1;
-                    if rng.gen_bool(cfg::SEED_DROP_CHANCE) {
+                    // Drops by enemy kind: slime/wolf drop seeds, golems smash into ore.
+                    if e.kind == 2 {
+                        if rng.gen_bool(0.7) {
+                            p.ore += 2;
+                            line.push_str(" It shattered into 2 ore!");
+                        }
+                    } else if rng.gen_bool(cfg::SEED_DROP_CHANCE) {
                         p.seeds += 1;
                         line.push_str(" It dropped a seed!");
                     }
@@ -343,12 +388,14 @@ fn handle_action(world: &mut World, client_id: ClientId, kind: ActionKind) {
             } else if let Some(crop) = plot.crop.as_mut() {
                 if crop.growth >= 1.0 {
                     plot.crop = None;
-                    player.seeds += cfg::SEEDS_PER_HARVEST;
+                    let seeds = cfg::harvest_seeds(player.gear);
+                    let turnips = cfg::harvest_turnips(player.gear);
+                    player.seeds += seeds;
+                    player.turnips += turnips;
                     player.harvests += 1;
                     world.logs.push(format!(
-                        "{name} harvested a {}! (+{} seeds)",
-                        cfg::CROP_NAME,
-                        cfg::SEEDS_PER_HARVEST
+                        "{name} harvested a {}! (+{seeds} seeds, +{turnips} turnips)",
+                        cfg::CROP_NAME
                     ));
                 } else if !crop.watered {
                     crop.watered = true;
@@ -358,6 +405,109 @@ fn handle_action(world: &mut World, client_id: ClientId, kind: ActionKind) {
                 }
             }
         }
+        ActionKind::Gather => {
+            let Some(player) = world.players.get_mut(&client_id) else {
+                return;
+            };
+            let name = hero_name(client_id);
+            let Some(ni) = cfg::nearest_node(player.pos[0], player.pos[1]) else {
+                world.logs.push(
+                    format!("{name} sees nothing to gather here. \
+                             Look for trees in the Whisperwood, boulders in the Quarry, \
+                             or ore veins in the Emberveins.")
+                );
+                return;
+            };
+            if !world.nodes[ni].ready {
+                world.logs.push(format!(
+                    "{name} found a depleted {}; it will regrow soon.",
+                    cfg::NODE_NAMES[cfg::node_kind(ni) as usize]
+                ));
+                return;
+            }
+            let kind = cfg::node_kind(ni) as usize;
+            let amount = cfg::GATHER_AMOUNT;
+            world.nodes[ni].ready = false;
+            world.nodes[ni].timer = cfg::NODE_RESPAWN_TIME;
+            match kind as u8 {
+                cfg::NODE_WOOD => player.wood += amount,
+                cfg::NODE_STONE => player.stone += amount,
+                _ => player.ore += amount,
+            }
+            world.logs.push(format!(
+                "{name} gathered {amount} {} from a {}!",
+                cfg::NODE_RESOURCE_NAMES[kind],
+                cfg::NODE_NAMES[kind]
+            ));
+        }
+        ActionKind::Craft(recipe_id) => {
+            let Some(recipe) = cfg::RECIPES.get(recipe_id as usize).copied() else {
+                return;
+            };
+            let Some(player) = world.players.get_mut(&client_id) else {
+                return;
+            };
+            let name = hero_name(client_id);
+            if recipe.gear != 0 && player.gear & recipe.gear != 0 {
+                world
+                    .logs
+                    .push(format!("{name} already owns a {}.", recipe.name));
+                return;
+            }
+            if !cfg::can_afford(&recipe, player.wood, player.stone, player.ore, player.turnips) {
+                world.logs.push(format!(
+                    "{name} lacks materials for {} ({}) - gather more or harvest turnips.",
+                    recipe.name,
+                    cfg::cost_text(&recipe)
+                ));
+                return;
+            }
+            player.wood -= recipe.wood;
+            player.stone -= recipe.stone;
+            player.ore -= recipe.ore;
+            player.turnips -= recipe.turnips;
+            if recipe.gear != 0 {
+                let old_max = cfg::max_hp(player.gear);
+                player.gear |= recipe.gear;
+                let new_max = cfg::max_hp(player.gear);
+                // New max HP grants the difference immediately (Titan Belt feel).
+                player.hp = (player.hp + (new_max - old_max)).min(new_max);
+                world.logs.push(format!(
+                    "{name} crafted a {}! ({})",
+                    recipe.name, recipe.blurb
+                ));
+            } else {
+                player.potions += 1;
+                world.logs.push(format!(
+                    "{name} brewed a {}! ({})",
+                    recipe.name, recipe.blurb
+                ));
+            }
+        }
+        ActionKind::Drink => {
+            let Some(player) = world.players.get_mut(&client_id) else {
+                return;
+            };
+            let name = hero_name(client_id);
+            if player.potions <= 0 {
+                world.logs.push(format!(
+                    "{name} has no Healing Draughts - craft one with key 6 (1w 1o 1t)."
+                ));
+                return;
+            }
+            let max = cfg::max_hp(player.gear);
+            if player.hp >= max {
+                world.logs.push(format!("{name} is already at full HP."));
+                return;
+            }
+            player.potions -= 1;
+            let before = player.hp;
+            player.hp = (player.hp + cfg::POTION_HEAL).min(max);
+            world.logs.push(format!(
+                "{name} quaffed a Healing Draught! (+{} HP)",
+                player.hp - before
+            ));
+        }
     }
 }
 
@@ -365,36 +515,60 @@ fn step(world: &mut World) {
     world.tick += 1;
     let dt = cfg::DT;
 
-    // --- players: move, cooldowns, regen, deaths ---
+    // --- players: move, cooldowns, regen, region changes, deaths ---
     let mut deaths = Vec::new();
+    let mut entered: Vec<(ClientId, cfg::Region)> = Vec::new();
     for (id, p) in world.players.iter_mut() {
+        let speed = cfg::player_speed(p.gear);
         let (dx, dy) = (p.move_input[0], p.move_input[1]);
         let len = (dx * dx + dy * dy).sqrt();
         if len > 1.0 {
             p.pos = cfg::clamp_to_field(
-                p.pos[0] + dx / len * cfg::PLAYER_SPEED * dt,
-                p.pos[1] + dy / len * cfg::PLAYER_SPEED * dt,
+                p.pos[0] + dx / len * speed * dt,
+                p.pos[1] + dy / len * speed * dt,
             );
         } else {
             p.pos = cfg::clamp_to_field(
-                p.pos[0] + dx * cfg::PLAYER_SPEED * dt,
-                p.pos[1] + dy * cfg::PLAYER_SPEED * dt,
+                p.pos[0] + dx * speed * dt,
+                p.pos[1] + dy * speed * dt,
             );
         }
 
         p.attack_cd = (p.attack_cd - dt).max(0.0);
-        p.regen_acc += dt * cfg::HP_REGEN_PER_SEC;
+        // The sanctuary mends wounds much faster than the open field.
+        let regen_rate = if cfg::in_safe_zone(p.pos[0], p.pos[1]) {
+            cfg::SAFE_REGEN_PER_SEC
+        } else {
+            cfg::HP_REGEN_PER_SEC
+        };
+        p.regen_acc += dt * regen_rate;
+        let max_hp = cfg::max_hp(p.gear);
         while p.regen_acc >= 1.0 {
-            p.hp = (p.hp + 1).min(cfg::PLAYER_MAX_HP);
+            p.hp = (p.hp + 1).min(max_hp);
             p.regen_acc -= 1.0;
         }
+
+        // Announce region transitions (both regions are `Copy` plain data).
+        let ri = cfg::region_index(p.pos[0], p.pos[1]);
+        if ri != p.region as usize {
+            p.region = ri as u8;
+            entered.push((*id, cfg::REGIONS[ri]));
+        }
+
         if p.hp <= 0 {
             deaths.push(*id);
         }
     }
+    for (id, region) in entered {
+        world.logs.push(format!(
+            "{} entered the {}.",
+            hero_name(id),
+            region.name
+        ));
+    }
     for id in deaths {
         if let Some(p) = world.players.get_mut(&id) {
-            p.hp = cfg::PLAYER_MAX_HP;
+            p.hp = cfg::max_hp(p.gear);
             p.regen_acc = 0.0;
             p.pos = cfg::clamp_to_field(cfg::SPAWN_POINT[0], cfg::SPAWN_POINT[1]);
         }
@@ -405,17 +579,20 @@ fn step(world: &mut World) {
         ));
     }
 
-    // --- enemies: chase nearest player, attack, cooldowns ---
+    // --- enemies: chase nearest player outside the sanctuary, attack ---
     for i in 0..world.enemies.len() {
         let (kind, epos) = {
             let e = &world.enemies[i];
             (e.kind, e.pos)
         };
 
-        // Nearest player within chase range.
+        // Nearest player within chase range (the sanctuary is off-limits).
         let mut target: Option<[f32; 2]> = None;
         let mut best = cfg::ENEMY_CHASE_RANGE * cfg::ENEMY_CHASE_RANGE;
         for p in world.players.values() {
+            if cfg::in_safe_zone(p.pos[0], p.pos[1]) {
+                continue;
+            }
             let dx = p.pos[0] - epos[0];
             let dy = p.pos[1] - epos[1];
             let d2 = dx * dx + dy * dy;
@@ -446,6 +623,9 @@ fn step(world: &mut World) {
                         .players
                         .values_mut()
                         .filter(|p| {
+                            if cfg::in_safe_zone(p.pos[0], p.pos[1]) {
+                                return false;
+                            }
                             let dx = p.pos[0] - epos[0];
                             let dy = p.pos[1] - epos[1];
                             dx * dx + dy * dy <= reach * reach
@@ -460,7 +640,8 @@ fn step(world: &mut World) {
                                 .unwrap()
                         })
                     {
-                        nearest.hp -= cfg::enemy_damage(kind);
+                        let raw = cfg::enemy_damage(kind);
+                        nearest.hp -= cfg::damage_taken(nearest.gear, raw);
                     }
                 }
             }
@@ -468,6 +649,25 @@ fn step(world: &mut World) {
         // hit cooldown tick
         let enemy = &mut world.enemies[i];
         enemy.hit_cd = (enemy.hit_cd - dt).max(0.0);
+    }
+
+    // --- sanctuary keeps monsters out entirely: project them back outside ---
+    {
+        let (cx, cy) = (cfg::SAFE_ZONE_CENTER[0], cfg::SAFE_ZONE_CENTER[1]);
+        let r = cfg::SAFE_ZONE_RADIUS + 4.0;
+        for e in world.enemies.iter_mut() {
+            let dx = e.pos[0] - cx;
+            let dy = e.pos[1] - cy;
+            let d2 = dx * dx + dy * dy;
+            if d2 < r * r {
+                let d = d2.sqrt();
+                if d < 0.001 {
+                    e.pos = [cx - r, cy];
+                } else {
+                    e.pos = [cx + dx / d * r, cy + dy / d * r];
+                }
+            }
+        }
     }
 
     // --- enemy separation (so they don't fully stack) ---
@@ -495,22 +695,33 @@ fn step(world: &mut World) {
         e.pos[1] += pv[1];
     }
 
-    // --- spawner ---
+    // --- spawner: monsters appear inside wild regions (never the sanctuary
+    //     or the homestead), with the region deciding the enemy mix ---
     world.spawn_timer -= dt;
     if world.spawn_timer <= 0.0 {
         world.spawn_timer = cfg::ENEMY_SPAWN_INTERVAL;
         if world.enemies.len() < cfg::ENEMY_CAP {
-            let mut rng = thread_rng();
-            let kind: u8 = if rng.gen_bool(0.75) { 0 } else { 1 };
-            let pos = random_edge_pos(&mut rng);
-            world.enemies.push(Enemy {
-                id: world.next_enemy_id,
-                kind,
-                pos,
-                hp: cfg::enemy_hp(kind),
-                hit_cd: 0.0,
-            });
-            world.next_enemy_id += 1;
+            let wilds = cfg::wild_regions();
+            if !wilds.is_empty() {
+                let mut rng = thread_rng();
+                let region = wilds[rng.gen_range(0..wilds.len())];
+                let kind = region.spawns[rng.gen_range(0..region.spawns.len())];
+                // Spawn well inside the region, away from its borders.
+                let pos = [
+                    rng.gen_range((region.rect[0] + 40.0)..(region.rect[2] - 40.0)),
+                    rng.gen_range((region.rect[1] + 40.0)..(region.rect[3] - 40.0)),
+                ];
+                if !cfg::in_safe_zone(pos[0], pos[1]) {
+                    world.enemies.push(Enemy {
+                        id: world.next_enemy_id,
+                        kind,
+                        pos,
+                        hp: cfg::enemy_hp(kind),
+                        hit_cd: 0.0,
+                    });
+                    world.next_enemy_id += 1;
+                }
+            }
         }
     }
 
@@ -521,15 +732,15 @@ fn step(world: &mut World) {
             crop.growth = (crop.growth + dt / cfg::CROP_GROW_TIME * mult).min(1.0);
         }
     }
-}
 
-fn random_edge_pos(rng: &mut impl Rng) -> [f32; 2] {
-    let (fx, fy) = (cfg::FIELD_HALF[0] - 24.0, cfg::FIELD_HALF[1] - 24.0);
-    match rng.gen_range(0..4) {
-        0 => [rng.gen_range(-fx..fx), -fy],
-        1 => [rng.gen_range(-fx..fx), fy],
-        2 => [-fx, rng.gen_range(-fy..fy)],
-        _ => [fx, rng.gen_range(-fy..fy)],
+    // --- depleted resource nodes regrow over time ---
+    for node in world.nodes.iter_mut() {
+        if !node.ready {
+            node.timer -= dt;
+            if node.timer <= 0.0 {
+                node.ready = true;
+            }
+        }
     }
 }
 
@@ -546,6 +757,12 @@ fn broadcast_snapshot(server: &mut RenetServer, world: &World) {
                 seeds: p.seeds,
                 harvests: p.harvests,
                 kills: p.kills,
+                wood: p.wood,
+                stone: p.stone,
+                ore: p.ore,
+                turnips: p.turnips,
+                potions: p.potions,
+                gear: p.gear,
             })
             .collect(),
         enemies: world
@@ -568,6 +785,11 @@ fn broadcast_snapshot(server: &mut RenetServer, world: &World) {
                     watered: c.watered,
                 }),
             })
+            .collect(),
+        nodes: world
+            .nodes
+            .iter()
+            .map(|n| NodeSnap { ready: n.ready })
             .collect(),
     };
     server.broadcast_message(
