@@ -26,3 +26,6 @@ First build is slow (Bevy from scratch); later builds are incremental.
 
 Harvesting yields seeds; killing monsters sometimes drops seeds. Slimes die in
 one hit; Shadow Wolves do not.
+
+
+# JO
